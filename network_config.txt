@@ -1,0 +1,66 @@
+#!/bin/bash
+# network_config.txt - Manual network segment classification for PCI DSS testing
+# Place this file in the same directory as the segment.sh script
+
+# ============================================================
+# NETWORK SEGMENT DEFINITIONS
+# ============================================================
+
+# Card Data Environment (CDE) segment
+# This is where cardholder data is stored, processed, or transmitted
+SEGMENTS["CDE"]="10.100.50.0/24"
+
+# Demilitarized Zone (DMZ) segment
+# This hosts public-facing services that don't contain cardholder data
+SEGMENTS["DMZ"]="192.168.10.0/24"
+
+# Corporate network segment
+# This contains user workstations and general business systems
+SEGMENTS["Corporate"]="10.200.0.0/16"
+
+# Development environment segment
+# This contains development and testing systems
+SEGMENTS["Development"]="172.16.50.0/24"
+
+# Additional segments as needed
+SEGMENTS["POS"]="10.150.30.0/24"            # Point of Sale systems
+SEGMENTS["Vendor"]="10.250.0.0/16"          # Third-party vendor systems
+SEGMENTS["Payment"]="10.100.60.0/24"        # Payment processing systems
+
+# ============================================================
+# ALLOWED COMMUNICATION PATHS
+# ============================================================
+# Format: "SourceSegment:DestinationSegment:Port"
+
+# Define paths required for normal business operations
+ALLOWED_PATHS=()
+
+# Web traffic from Corporate to DMZ
+ALLOWED_PATHS+=("Corporate:DMZ:80")         # HTTP
+ALLOWED_PATHS+=("Corporate:DMZ:443")        # HTTPS
+
+# Secure access from Corporate to CDE
+ALLOWED_PATHS+=("Corporate:CDE:443")        # HTTPS access to CDE applications
+ALLOWED_PATHS+=("Corporate:CDE:8443")       # Additional secure port
+
+# Allow DMZ to communicate with Payment systems
+ALLOWED_PATHS+=("DMZ:Payment:443")          # Secure payment API access
+ALLOWED_PATHS+=("DMZ:Payment:9443")         # Additional payment gateway port
+
+# Allow POS systems to reach payment processing
+ALLOWED_PATHS+=("POS:Payment:443")          # Transaction processing
+ALLOWED_PATHS+=("POS:Payment:8443")         # Additional secure channel
+
+# Allow limited Corporate access to Development
+ALLOWED_PATHS+=("Corporate:Development:22") # SSH access for developers
+ALLOWED_PATHS+=("Corporate:Development:443") # Web access to development tools
+
+# ============================================================
+# CUSTOM TEST SETTINGS
+# ============================================================
+
+# Custom egress test domain (optional)
+# EGRESS_TEST_DOMAIN="yourtest.example.com"
+
+# Define a custom list of ports to test for egress (optional)
+# TEST_PORTS=("80" "443" "53" "8080" "8443")
