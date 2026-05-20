@@ -586,24 +586,52 @@ get_random_ip() {
     echo "${prefix}.${random_last}"
 }
 
-# Function to test egress connectivity - use actual testing
+# Test egress connectivity against the BHIS canary (letmeoutofyour.net).
+#
+# The canary listens on every TCP port and writes a marker ("w00tw00t") in
+# its response. We don't just check that a TCP handshake completed — that
+# only tells us a transparent proxy / captive portal / inspection box was
+# willing to terminate the connection. To prove actual end-to-end egress
+# we have to see the canary's marker in the returned bytes.
+#
+# Three outcomes:
+#   FAIL — marker received: data round-tripped to the canary; egress is open.
+#   INFO — bytes received but marker absent: something proxied or intercepted
+#          the connection; not a clean pass *or* fail without more analysis.
+#   PASS — no data received: connection refused, dropped, or fully filtered.
 test_egress() {
     local port=$1
     local protocol=$2
-    
+
     echo -e "\n${YELLOW}Testing egress on port $port ($protocol)${NC}"
-    
-    # Perform actual TCP testing
-    echo -e "  ${WHITE}Command: nc -zv -w 5 $EGRESS_TEST_DOMAIN $port${NC}"
-    if nc -zv -w 5 $EGRESS_TEST_DOMAIN $port &>/dev/null; then
-        echo -e "  ${WHITE}Response: Connection to $EGRESS_TEST_DOMAIN ($EGRESS_TEST_DOMAIN_IP) $port port [tcp/*] succeeded!${NC}"
-        show_result "Egress test on $protocol port $port" "FAIL" "Connection to $EGRESS_TEST_DOMAIN:$port established"
-        echo -e "  ${RED}${BOLD}SECURITY RISK:${NC} Unauthorized outbound channel detected"
-        echo -e "  ${YELLOW}${BOLD}REMEDIATION:${NC} Configure firewall to block outbound traffic on port $port"
+    echo -e "  ${WHITE}Probe: TCP $EGRESS_TEST_DOMAIN:$port, expect marker '$RESPONSE_CHECK' in response${NC}"
+
+    local response
+    if [[ "$port" == "80" || "$port" == "8080" ]]; then
+        # HTTP ports: the canary won't write a banner unprompted, so send a request.
+        response=$(printf 'GET / HTTP/1.0\r\nHost: %s\r\n\r\n' "$EGRESS_TEST_DOMAIN" \
+                   | timeout 5 nc -w 5 "$EGRESS_TEST_DOMAIN" "$port" 2>/dev/null)
+    else
+        # Everything else: banner-grab — the canary writes its marker on connect.
+        response=$(timeout 5 nc -w 5 "$EGRESS_TEST_DOMAIN" "$port" </dev/null 2>/dev/null)
+    fi
+
+    if [[ "$response" == *"$RESPONSE_CHECK"* ]]; then
+        echo -e "  ${WHITE}Response: canary marker received${NC}"
+        show_result "Egress test on $protocol port $port" "FAIL" "Reached $EGRESS_TEST_DOMAIN:$port and saw marker '$RESPONSE_CHECK' — real egress" "egress" "1.3.4"
+        echo -e "  ${RED}${BOLD}SECURITY RISK:${NC} Unauthorized outbound channel confirmed by canary"
+        echo -e "  ${YELLOW}${BOLD}REMEDIATION:${NC} Block outbound TCP on port $port (or restrict to allowlist)"
+        return 0
+    elif [[ -n "$response" ]]; then
+        # TCP completed and bytes flowed, but they didn't come from the canary.
+        # Most likely cause: a transparent proxy / NGFW / captive portal
+        # answering on behalf of the destination.
+        echo -e "  ${WHITE}Response: bytes received but no canary marker — proxy or inspection layer suspected${NC}"
+        show_result "Egress test on $protocol port $port" "INFO" "TCP completed but $RESPONSE_CHECK marker not seen (possible transparent proxy on path)" "egress" "1.3.4"
         return 0
     else
-        echo -e "  ${WHITE}Response: Connection timed out${NC}"
-        show_result "Egress test on $protocol port $port" "PASS" "Connection properly blocked"
+        echo -e "  ${WHITE}Response: no data received (connection refused, dropped, or filtered)${NC}"
+        show_result "Egress test on $protocol port $port" "PASS" "No data received from canary — egress appears blocked" "egress" "1.3.4"
         return 1
     fi
 }
