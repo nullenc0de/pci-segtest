@@ -1,99 +1,168 @@
 # PCI DSS v4.0 Network Testing Tool
 
-## Overview
+A network segmentation and egress-control validation tool for PCI DSS v4.0
+compliance assessments. Runs from a single vantage host inside (or adjacent
+to) the Card Data Environment and reports what's actually reachable —
+distinguishing real egress from canary allowlists and TLS-inspection
+interception.
 
-This tool helps assess network segmentation and egress control compliance with PCI DSS v4.0 requirements. It automatically discovers network segments, tests segmentation between them, and checks for unauthorized egress paths that could lead to data exfiltration.
-
-## Features
-
-- **Automatic Network Discovery**: Identifies available network segments without requiring manual configuration
-- **Segmentation Testing**: Tests network isolation between segments to verify PCI DSS segmentation requirements
-- **Egress Control Testing**: Verifies that outbound connections are properly restricted
-- **DNS Exfiltration Testing**: Checks for DNS-based data exfiltration risks
-- **File Transfer Testing**: Tests for unrestricted file upload capabilities
-
-## Requirements
-
-- Bash shell environment
-- Network utilities: `ip`, `nc` (netcat), `host`, `getent`, and `curl`
-- Run from within the CDE (Card Data Environment)
-- Root/sudo access for network discovery (recommended)
-
-## Usage
+## Quick start
 
 ```bash
-# Basic usage
-./segment.sh
+# Recommended dependencies (script degrades gracefully without them, with warnings)
+sudo apt-get install -y jq dnsutils ntpsec-ntpdate netcat-openbsd dnsutils openssl
 
-# With sudo (recommended for better network discovery)
+# Run
 sudo ./segment.sh
 ```
 
+Outputs three artifacts in the working directory:
+
+- `pci_test_<timestamp>.log` — full text log of every check
+- `pci_report_<timestamp>.json` — structured per-check JSON (populated when `jq` is installed)
+- `pci_executive_summary_<timestamp>.txt` — short summary suitable for the engagement deliverable
+
+## What's tested
+
+### Phase 1 — Network segmentation (PCI DSS 1.3.x)
+
+- **Allowed-path verification** (`ALLOWED_PATHS` from `network_config.txt`):
+  confirms required cross-segment paths actually work.
+- **Isolation tests**: for every segment pair *not* in `ALLOWED_PATHS`,
+  probes a sampling of admin/database/web ports and reports any that get
+  through as a segmentation failure.
+- **Liveness gating**: random-IP targets that don't respond to ICMP or
+  TCP/22/80/443 are reported as `INFO` rather than `PASS`, because a
+  ghost address answering "no" tells us nothing about the firewall.
+
+### Phase 2 — Egress control (PCI DSS 1.3.4)
+
+Egress testing is the part most often broken in similar tools, so this
+one is deliberately layered:
+
+1. **Canary marker check** against `letmeoutofyour.net` (Black Hills
+   Information Security's egress canary). Every port returns a
+   `w00tw00t` marker on TCP connect (HTTP ports need a `GET`), so we
+   can prove the bytes actually round-tripped rather than just trusting
+   that the TCP handshake completed.
+2. **Reference-IP cross-check** against `1.1.1.1`, `8.8.8.8`, `9.9.9.9`.
+   If the canary is reachable but no reference IP is, the canary is
+   likely allowlisted by the customer's firewall and the canary result
+   alone would be a false-positive finding.
+3. **External DNS resolver probe** (`dig` against 1.1.1.1, 8.8.8.8,
+   9.9.9.9 on UDP/53). DNS being open to any external resolver is a
+   PCI 1.3.4 risk; the box should resolve only via internal recursors.
+4. **NTP (UDP/123)** to `pool.ntp.org`. Often-overlooked exfil/C2 vector.
+5. **TLS handshake validation** on `:443` to each reference IP. A clean
+   TCP open with a stalled TLS handshake indicates a TLS-inspection or
+   SNI-filter middlebox on the path — neither a clean PASS nor a clean
+   FAIL, classified `INFO` for further investigation.
+6. **DNS exfiltration** via internal recursor (queries an arbitrary
+   subdomain of the canary; if it resolves, exfil via encoded
+   subdomains is viable).
+7. **ICMP and HTTP-header exfil** probes for the long-tail channels.
+
+### Phase 3 — Other PCI DSS v4.0 checks
+
+- System hardening (PCI DSS 2.2.1): scans a CDE target for unnecessary
+  services. Skipped (`INFO`) if the target host is offline.
+- TLS configuration (PCI DSS 4.2.1): checks SSLv3 is refused and TLS 1.2
+  is offered. Reachability-gated so a closed port doesn't false-PASS.
+- Audit logging (PCI DSS 10.2): verifies `auditd` is running.
+- IPv6 detection / configuration (PCI DSS 1.2.3, 1.3.4).
+
+## Result semantics
+
+| Status | Meaning |
+|--------|---------|
+| `PASS` | Control is working — connection blocked / cipher refused / service disabled, as expected. |
+| `FAIL` | Control is missing or broken — finding for the report. |
+| `INFO` | Couldn't validate the control. Common reasons: target host offline (no point probing), canary appears allowlisted, TLS-inspection middlebox terminating connections, optional dependency missing. Treat these as "needs follow-up", not "passed". |
+
+`INFO` and `SKIP` are tracked separately from `PASS`/`FAIL` in the
+summary so a run that legitimately couldn't probe anything doesn't
+masquerade as compliant.
+
 ## Configuration
 
-The tool automatically discovers network segments, but for more accurate testing, you can provide a manual configuration file:
+Drop a `network_config.txt` in the same directory as the script to
+override autodiscovery. Example:
 
-1. Create a file named `network_config.txt` in the same directory as the script
-2. Define your network segments and allowed paths (see sample_config.txt)
-3. Run the script again to use your manual configuration
+```bash
+SEGMENTS["CDE"]="10.50.10.0/24"
+SEGMENTS["DMZ"]="192.168.10.0/24"
+SEGMENTS["Corporate"]="10.200.0.0/16"
 
-## Test Phases
+ALLOWED_PATHS+=("Corporate:CDE:443")
+ALLOWED_PATHS+=("DMZ:CDE:443")
+```
 
-### Phase 1: Network Segmentation Testing
+You can also override the egress canary, reference IPs, and resolver
+list (defined near the top of the script):
 
-Tests network isolation between segments to verify PCI DSS Requirements 1.3.1, 1.3.2, and 1.3.3:
+```bash
+EGRESS_TEST_DOMAIN="letmeoutofyour.net"
+RESPONSE_CHECK="w00tw00t"
+EGRESS_REFERENCE_IPS=("1.1.1.1" "8.8.8.8" "9.9.9.9")
+EXTERNAL_DNS_RESOLVERS=("1.1.1.1" "8.8.8.8" "9.9.9.9")
+```
 
-- Tests isolation between all discovered network segments
-- Verifies that administrative ports (22, 3389) are properly restricted
-- Checks that database ports (1433, 3306) are properly secured
+## Limitations
 
-### Phase 2: Egress Control Testing
+Be honest about what a single-vantage tool can and can't tell you:
 
-Tests egress controls to verify PCI DSS Requirement 1.3.4:
+- **Single vantage**: tests run from one host inside (or adjacent to)
+  the CDE. We can verify "this host can/can't reach X" — we can't
+  verify "non-CDE hosts can't reach the CDE" without a probe placed in
+  the non-CDE segment. A complete segmentation assessment needs
+  probes on each side of the boundary.
+- **Random-IP segmentation tests**: when `network_config.txt` doesn't
+  specify known live hosts per segment, the script uses random IPs in
+  the segment's CIDR. Those tests are `INFO` (skipped) when the random
+  IP doesn't respond — a "no answer" from a ghost address doesn't
+  prove segmentation. Provide real hosts in `network_config.txt` for
+  meaningful results.
+- **Canary allowlisting**: customers commonly add the assessor's
+  canary host to a firewall allowlist so testing works at all. The
+  reference-IP cross-check catches this — without it, every port
+  would look open.
 
-- Tests outbound connectivity on common ports (21, 22, 23, 25, 53, 80, 443, etc.)
-- Checks for DNS exfiltration vulnerabilities
-- Tests for unrestricted file upload capabilities
+## Requirements
 
-## Output
+- Bash 4+
+- Required: `ip`, `ping`, `nc` (netcat-openbsd)
+- Recommended: `jq` (for JSON report), `dig` (`dnsutils`, for DNS resolver
+  egress), `ntpdate`/`ntpsec-ntpdate` (UDP/123), `openssl` (TLS probes),
+  `curl`, `host`
+- Run as root or with sudo for full network discovery and ICMP
 
-The tool produces detailed, color-coded output with:
+## Output / interpretation
 
-- Pass/fail indicators for each test
-- Detailed diagnostics for failed tests
-- PCI DSS requirement references
-- Remediation suggestions
-- Summary statistics and overall compliance status
+A typical good run on a properly-segmented CDE host looks like:
 
-## Customization
+```
+Total Tests Executed: 36
+Tests Passed:         9
+Tests Failed:         7
+Tests Skipped/Info:   20
+```
 
-To test specific network segments or allowed paths:
+A high `INFO` count is normal — it reflects the script being honest
+about what it could and couldn't actually test from a single vantage.
+The deliverable should reflect the `FAIL` count and explain the `INFO`
+classifications case-by-case.
 
-1. Create a custom `network_config.txt` file
-2. Define your SEGMENTS and ALLOWED_PATHS
-3. Run the script with your configuration
+## Security considerations
 
-## Interpreting Results
-
-- **PASS**: The tested control is working as expected
-- **FAIL**: The tested control is not properly implemented and requires remediation
-- Review all failed tests and implement the suggested remediation measures
-- Address egress control failures to prevent data exfiltration
-- Ensure proper segmentation to restrict access to cardholder data
-
-## Security Considerations
-
-- Run this tool in a controlled environment
-- Coordinate testing with your security team
-- Schedule testing during maintenance windows when possible
-- Obtain proper authorization before testing
-
-## Troubleshooting
-
-- If no segments are discovered, verify your network configuration
-- If all tests fail, check network connectivity and firewall settings
-- If DNS tests fail unexpectedly, verify DNS resolution is working
+- Run with explicit authorization. The egress probes are mostly
+  passive but the segmentation tests touch arbitrary IPs in the
+  target subnets.
+- Test against the canary involves outbound connections to
+  `letmeoutofyour.net` (45.33.104.77). Brief the customer that the
+  scanner host needs outbound network access for the test to work.
+- Schedule during a maintenance window when possible; the
+  comprehensive port scan can generate IDS events.
 
 ## License
 
-This tool is provided for internal use only and should not be distributed without permission.
+Provided as-is for security assessment use.

