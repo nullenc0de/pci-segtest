@@ -12,8 +12,11 @@ interception.
 # Recommended dependencies (script degrades gracefully without them, with warnings)
 sudo apt-get install -y jq dnsutils ntpsec-ntpdate netcat-openbsd dnsutils openssl
 
-# Run
+# Standard run (general CDE host)
 sudo ./segment.sh
+
+# Run on the authorized vulnerability scanner host
+sudo ./segment.sh --scanner-host
 ```
 
 Outputs three artifacts in the working directory:
@@ -82,6 +85,36 @@ one is deliberately layered:
 `INFO` and `SKIP` are tracked separately from `PASS`/`FAIL` in the
 summary so a run that legitimately couldn't probe anything doesn't
 masquerade as compliant.
+
+## Scanner-host exception (`--scanner-host`)
+
+The authorized vulnerability scanner (Nessus, Qualys, etc.) running
+inside the CDE needs outbound 80/443 (and effectively DNS via the
+internal recursor) to pull plugin updates and OS patches — that's a
+documented PCI exception, not a finding.
+
+Pass `--scanner-host` and the script reclassifies the ports a scanner
+needs from `FAIL` to `INFO` with a "scanner-host exception" note:
+
+```bash
+sudo ./segment.sh --scanner-host
+```
+
+Default scanner allowlist is `53 80 443`. Override via env or
+`network_config.txt`:
+
+```bash
+SCANNER_ALLOWED_PORTS=(80 443)   # stricter — disallow direct external DNS
+```
+
+Things that **don't** get downgraded even in `--scanner-host` mode:
+findings on unrelated ports (e.g. `:8080`, `:8443`), the DNS exfil
+test (recursor accepting arbitrary subdomains is a scanner-independent
+issue), `auditd` not running, and TLS handshake INFO classifications.
+
+**Do not pass this flag on general-purpose CDE hosts** — it hides real
+findings. The flag is recorded in the executive summary so report
+readers know it was used.
 
 ## Configuration
 

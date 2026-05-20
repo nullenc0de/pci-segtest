@@ -21,6 +21,56 @@ SKIPPED=0
 LOG_FILE="pci_test_$(date +%Y%m%d_%H%M%S).log"
 JSON_REPORT="pci_report_$(date +%Y%m%d_%H%M%S).json"
 
+# --- CLI flags ---------------------------------------------------------
+# --scanner-host: re-classify FAIL on the ports a documented vulnerability
+# scanner (Nessus, Qualys, etc.) legitimately needs outbound — apt/yum,
+# Tenable plugin feed, DNS — as INFO with a "scanner-host exception"
+# note. Only use this on the actual scanner host; running it on other
+# CDE machines would mask real findings.
+SCANNER_HOST=0
+SCANNER_ALLOWED_PORTS=(53 80 443)
+
+# Parse args.  Keep parsing simple — long flags only, ignore unknown
+# args so the script remains backward-compatible with shell-style env
+# overrides that callers may pass in.
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --scanner-host)
+            SCANNER_HOST=1
+            shift ;;
+        -h|--help)
+            cat <<'HELP'
+Usage: ./segment.sh [--scanner-host]
+
+  --scanner-host
+        Mark this host as the authorized vulnerability scanner.
+        FAIL classifications on ports the scanner needs for plugin /
+        OS updates (53/80/443 by default) are downgraded to INFO with
+        a "scanner-host exception" note in the result details.
+        Override the port list by setting SCANNER_ALLOWED_PORTS in
+        network_config.txt or in the environment before invocation.
+
+        Do NOT pass this on general-purpose CDE hosts — it will hide
+        real findings.
+HELP
+            exit 0 ;;
+        *)
+            shift ;;
+    esac
+done
+
+# is_scanner_exception PORT — return 0 if --scanner-host is active and
+# PORT is in the documented scanner egress allowlist, else 1.
+is_scanner_exception() {
+    local p=$1
+    [[ $SCANNER_HOST -eq 1 ]] || return 1
+    local allow
+    for allow in "${SCANNER_ALLOWED_PORTS[@]}"; do
+        [[ "$p" == "$allow" ]] && return 0
+    done
+    return 1
+}
+
 # Initialize detailed logging
 init_logging() {
     echo "PCI DSS v4.0 Compliance Test Log - $(date)" > "$LOG_FILE"
@@ -557,6 +607,9 @@ echo -e "${YELLOW}Testing from IP: $(ip route get 1 | awk '{print $(NF-2);exit}'
 echo -e "${YELLOW}Date: $(date)${NC}"
 echo -e "${YELLOW}Environment: CDE (Card Data Environment) - Running tests from inside CDE${NC}"
 echo -e "${WHITE}Version: 1.3.0 (Enhanced - February 2025)${NC}"
+if [[ $SCANNER_HOST -eq 1 ]]; then
+    echo -e "${PURPLE}${BOLD}Scanner-host mode:${NC} ${WHITE}--scanner-host enabled — FAIL on ports ${SCANNER_ALLOWED_PORTS[*]} will be re-classified as INFO (scanner exception)${NC}"
+fi
 echo -e "${CYAN}Log File: $LOG_FILE${NC}"
 echo -e "${CYAN}JSON Report: $JSON_REPORT${NC}"
 draw_line
@@ -698,9 +751,13 @@ test_egress() {
     # 3. Classify
     if [[ $canary_marker -eq 1 && ${#reached_refs[@]} -gt 0 ]]; then
         echo -e "  ${WHITE}Response: canary marker received AND reference IPs reachable (${reached_refs[*]})${NC}"
-        show_result "Egress test on $protocol port $port" "FAIL" "Canary marker received and reference IPs reachable (${reached_refs[*]}) — general egress open" "egress" "1.3.4"
-        echo -e "  ${RED}${BOLD}SECURITY RISK:${NC} Unauthorized outbound channel — open to multiple destinations"
-        echo -e "  ${YELLOW}${BOLD}REMEDIATION:${NC} Block outbound TCP on port $port (or restrict to allowlist)"
+        if is_scanner_exception "$port"; then
+            show_result "Egress test on $protocol port $port" "INFO" "Scanner-host exception (--scanner-host): port $port reachable to ${reached_refs[*]} — required for plugin / OS updates" "egress" "1.3.4"
+        else
+            show_result "Egress test on $protocol port $port" "FAIL" "Canary marker received and reference IPs reachable (${reached_refs[*]}) — general egress open" "egress" "1.3.4"
+            echo -e "  ${RED}${BOLD}SECURITY RISK:${NC} Unauthorized outbound channel — open to multiple destinations"
+            echo -e "  ${YELLOW}${BOLD}REMEDIATION:${NC} Block outbound TCP on port $port (or restrict to allowlist)"
+        fi
         return 0
     elif [[ $canary_marker -eq 1 ]]; then
         # Canary works but nothing else does — canary is likely allowlisted.
@@ -712,8 +769,12 @@ test_egress() {
         # Could be a TLS/HTTP inspection box that allows reference IPs but
         # blocks letmeoutofyour.net by name, or canary infra hiccup.
         echo -e "  ${WHITE}Response: reference IPs reachable (${reached_refs[*]}) but no canary marker${NC}"
-        show_result "Egress test on $protocol port $port" "FAIL" "Reference IPs ${reached_refs[*]} reachable on $port (canary unreachable — possibly name-blocked)" "egress" "1.3.4"
-        echo -e "  ${YELLOW}${BOLD}NOTE:${NC} General egress confirmed via reference IPs; canary appears blocked separately"
+        if is_scanner_exception "$port"; then
+            show_result "Egress test on $protocol port $port" "INFO" "Scanner-host exception (--scanner-host): port $port reachable to ${reached_refs[*]} (canary blocked separately) — required for plugin / OS updates" "egress" "1.3.4"
+        else
+            show_result "Egress test on $protocol port $port" "FAIL" "Reference IPs ${reached_refs[*]} reachable on $port (canary unreachable — possibly name-blocked)" "egress" "1.3.4"
+            echo -e "  ${YELLOW}${BOLD}NOTE:${NC} General egress confirmed via reference IPs; canary appears blocked separately"
+        fi
         return 0
     elif [[ $canary_tcp_bytes -eq 1 ]]; then
         # Canary TCP completed but no marker, and no reference IPs reachable.
@@ -815,9 +876,13 @@ test_tls_egress_handshake() {
         local out
         out=$(timeout 8 openssl s_client -connect "$ref:443" -servername "$ref" </dev/null 2>&1)
         if grep -q "Cipher is\s*[A-Za-z0-9_-]" <<<"$out"; then
-            show_result "TLS Egress - 443 to $ref" "FAIL" "Completed TLS handshake to $ref:443 — full HTTPS egress" "egress" "1.3.4"
-            echo -e "  ${RED}${BOLD}PCI DSS VIOLATION:${NC} Requirement 1.3.4 — unrestricted HTTPS egress"
-            echo -e "  ${YELLOW}${BOLD}REMEDIATION:${NC} Restrict outbound 443 to an allowlist (or TLS-inspect with cert pinning)"
+            if is_scanner_exception 443; then
+                show_result "TLS Egress - 443 to $ref" "INFO" "Scanner-host exception (--scanner-host): HTTPS to $ref:443 succeeds — required for plugin / OS updates" "egress" "1.3.4"
+            else
+                show_result "TLS Egress - 443 to $ref" "FAIL" "Completed TLS handshake to $ref:443 — full HTTPS egress" "egress" "1.3.4"
+                echo -e "  ${RED}${BOLD}PCI DSS VIOLATION:${NC} Requirement 1.3.4 — unrestricted HTTPS egress"
+                echo -e "  ${YELLOW}${BOLD}REMEDIATION:${NC} Restrict outbound 443 to an allowlist (or TLS-inspect with cert pinning)"
+            fi
         else
             # TCP opened but openssl didn't report a cipher — handshake
             # never completed. Classic TLS-inspection / SNI-filter pattern.
@@ -1276,6 +1341,7 @@ PCI DSS v4.0 COMPLIANCE TEST - EXECUTIVE SUMMARY
 Test Date: $(date)
 Tester: $(whoami)@$(hostname)
 Environment: Card Data Environment (CDE)
+Scanner-host mode: $([ $SCANNER_HOST -eq 1 ] && echo "ENABLED (--scanner-host) — egress on ports ${SCANNER_ALLOWED_PORTS[*]} reclassified FAIL -> INFO" || echo 'disabled')
 
 OVERALL COMPLIANCE STATUS: $([ $FAILED -gt 0 ] && echo 'NON-COMPLIANT' || echo 'COMPLIANT')
 
